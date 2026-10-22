@@ -72,9 +72,15 @@ import { SunshineClipboardBlobTransport } from '../service/clipboard/SunshineCli
 import { ThreeFingerImeGestureHandler, ThreeFingerImeGestureResult } from '../service/input/ThreeFingerImeGestureHandler';
 import { Logger } from '../common/Logger';
 import { UI } from '../common/UI';
+import { AppState, AppStateService } from '../service/AppStateService';
 
 /** 串流 NavDestination 的焦点 key，供 requestStreamFocus 拉回键盘焦点 */
 const STREAM_FOCUS_KEY = 'streamNavDestination';
+
+// 卡死自愈看门狗：连续多少秒既没有收到帧也没有渲染帧就判定为画面停摆
+const STALL_TRIGGER_SECONDS: number = 5;
+// 一次会话内最多自动重连几次（避免无限重连）
+const STALL_MAX_RECOVERY_ATTEMPTS: number = 3;
 
 /** MouseEmulationCallback 的具体实现，桥接 MoonBridge 鼠标 API */
 class MoonBridgeMouseCallback implements MouseEmulationCallback {
@@ -235,6 +241,16 @@ struct StreamPage {
   private mouseDisplaySync: displaySync.DisplaySync | null = null;
   private streamDisplaySync: displaySync.DisplaySync | null = null;
   private streamFrameDiagnosticTimer: number | null = null;
+
+  // === 卡死自愈看门狗 ===
+  // 现场抓到两类"永久冻结"：解码器提交线程静默停摆（Rx/Rd 都为 0，且客户端连
+  // IDR 请求都不再发出），以及 "waiting for IDR frame" 死循环。两者都不会自愈，
+  // 只能手动断开重连。这里在前台、已连接、连续 N 秒既没有收到帧也没有渲染帧时
+  // 自动执行一次重连（与用户手动操作完全同一条路径）。
+  private stallWatchdogTimer: number | null = null;
+  private stallZeroFrameSeconds: number = 0;
+  private stallRecoveryAttempts: number = 0;
+  private stallRecovering: boolean = false;
   private streamDisplayCallbacks: number = 0;
   private xComponentFrameRequestActive: boolean = false;
   @State private mouseInputSuspended: boolean = false;
@@ -1613,6 +1629,7 @@ struct StreamPage {
       // 获取 surfaceId → 设置帧率 → 启动串流
       await this.launchStream();
       this.streamStartedAtMs = Date.now();
+      this.startStallWatchdog();
 
       // 串流就绪后再做 AI 服务可用性探测，避免与启动链路抢带宽
       this.probeAiAvailableDeferred();
@@ -1830,6 +1847,73 @@ struct StreamPage {
     }
   }
 
+  /**
+   * 启动"卡死自愈"看门狗。
+   * 只在应用处于前台时判定：后台保活期间 Rx 为 0 属于正常现象，不能误触发重连。
+   */
+  private startStallWatchdog(): void {
+    this.stopStallWatchdog();
+    this.stallZeroFrameSeconds = 0;
+    this.stallRecoveryAttempts = 0;
+    this.stallRecovering = false;
+
+    this.stallWatchdogTimer = setInterval(() => {
+      if (this.pageDisposed || this.viewModel.isStopping || this.stallRecovering) {
+        return;
+      }
+      if (AppStateService.getInstance().getCurrentState() !== AppState.FOREGROUND) {
+        this.stallZeroFrameSeconds = 0;
+        return;
+      }
+      if (!this.viewModel.isConnected) {
+        this.stallZeroFrameSeconds = 0;
+        return;
+      }
+
+      const session = this.viewModel.getSession();
+      if (session === null) {
+        this.stallZeroFrameSeconds = 0;
+        return;
+      }
+      const stats = session.getStats();
+      const receiving = stats.fps > 0.5 || stats.renderedFps > 0.5;
+      if (receiving) {
+        this.stallZeroFrameSeconds = 0;
+        // 恢复出帧后重置尝试次数，允许后续再次自愈
+        this.stallRecoveryAttempts = 0;
+        return;
+      }
+
+      this.stallZeroFrameSeconds++;
+      if (this.stallZeroFrameSeconds < STALL_TRIGGER_SECONDS) {
+        return;
+      }
+
+      this.stallZeroFrameSeconds = 0;
+      if (this.stallRecoveryAttempts >= STALL_MAX_RECOVERY_ATTEMPTS) {
+        Logger.error('StreamPage',
+          `[StallWatchdog] 连续 ${STALL_MAX_RECOVERY_ATTEMPTS} 次自愈失败，停止自动重连`);
+        return;
+      }
+      this.stallRecoveryAttempts++;
+      this.stallRecovering = true;
+      Logger.warn('StreamPage',
+        `[StallWatchdog] 检测到画面停摆（Rx/Rd 均为 0），第 ${this.stallRecoveryAttempts} 次自动重连`);
+      this.reconnectStreaming().finally(() => {
+        this.stallRecovering = false;
+      });
+    }, 1000);
+  }
+
+  private stopStallWatchdog(): void {
+    if (this.stallWatchdogTimer !== null) {
+      clearInterval(this.stallWatchdogTimer);
+      this.stallWatchdogTimer = null;
+    }
+    this.stallZeroFrameSeconds = 0;
+    this.stallRecovering = false;
+  }
+
   private startStreamFrameDiagnostics(displayHz: number): void {
     if (this.streamFrameDiagnosticTimer !== null) clearInterval(this.streamFrameDiagnosticTimer);
     this.streamDisplayCallbacks = 0;
@@ -1877,6 +1961,7 @@ struct StreamPage {
     this.inputHandler.resetState();
     this.inputHandler.stopMouseInterceptor();
     this.stopMouseKeepAlive();
+    this.stopStallWatchdog();
     this.resetStreamFrameHints();
     try {
       pointer.setPointerVisibleSync(true);
@@ -2132,6 +2217,7 @@ struct StreamPage {
       // 获取 surfaceId → 设置帧率 → 启动串流
       await this.launchStream();
       this.streamStartedAtMs = Date.now();
+      this.startStallWatchdog();
 
       // 连接终止时已停用键盘转发，重连成功后恢复（条件判断在 startKeyInterceptor
       // 内部；复核逻辑同 startStreaming：不能用等首帧才翻转的 isConnected，
